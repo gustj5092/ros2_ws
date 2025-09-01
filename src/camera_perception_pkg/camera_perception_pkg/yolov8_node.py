@@ -1,311 +1,159 @@
-# Copyright (C) 2023  Miguel Ángel González Santamarta
-
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-
-from typing import List, Dict
+# yolo_node.py 또는 lane_detection_node.py 파일
 
 import rclpy
-from rclpy.qos import QoSProfile
-from rclpy.qos import QoSHistoryPolicy
-from rclpy.qos import QoSDurabilityPolicy
-from rclpy.qos import QoSReliabilityPolicy
-from rclpy.lifecycle import LifecycleNode
-from rclpy.lifecycle import TransitionCallbackReturn
-from rclpy.lifecycle import LifecycleState
-
-from cv_bridge import CvBridge
-
-from ultralytics import YOLO
-from ultralytics.engine.results import Results
-from ultralytics.engine.results import Boxes
-from ultralytics.engine.results import Masks
-from ultralytics.engine.results import Keypoints
-from torch import cuda
-
+from rclpy.node import Node
 from sensor_msgs.msg import Image
-from interfaces_pkg.msg import Point2D
-from interfaces_pkg.msg import BoundingBox2D
-from interfaces_pkg.msg import Mask
-from interfaces_pkg.msg import KeyPoint2D
-from interfaces_pkg.msg import KeyPoint2DArray
-from interfaces_pkg.msg import Detection
-from interfaces_pkg.msg import DetectionArray
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
 
-from std_srvs.srv import SetBool
+class LaneDetectionNode(Node):
 
-
-class Yolov8Node(LifecycleNode):
-
-    def __init__(self, **kwargs) -> None:
-        super().__init__("yolov8_node", **kwargs)
+    def __init__(self):
+        super().__init__("lane_detection_node")
         
-        #---------------Variable Setting---------------
-        # 딥러닝 모델 pt 파일명 작성
-        #self.declare_parameter("model", "yolov8m.pt")
-        self.declare_parameter("model", "best.pt")
-        
-        # 추론 하드웨어 선택 (cpu / gpu) 
-        self.declare_parameter("device", "cpu")
-        #self.declare_parameter("device", "cuda:0")
-        #----------------------------------------------
-        
-        self.declare_parameter("threshold", 0.5)
-        self.declare_parameter("enable", True)
-        self.declare_parameter("image_reliability",
-                               QoSReliabilityPolicy.RELIABLE)
-
-        self.get_logger().info('Yolov8Node created')
-
-    def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
-        self.get_logger().info(f'Configuring {self.get_name()}')
-
-        self.model = self.get_parameter(
-            "model").get_parameter_value().string_value
-
-        self.device = self.get_parameter(
-            "device").get_parameter_value().string_value
-
-        self.threshold = self.get_parameter(
-            "threshold").get_parameter_value().double_value
-
-        self.enable = self.get_parameter(
-            "enable").get_parameter_value().bool_value
-
-        self.reliability = self.get_parameter(
-            "image_reliability").get_parameter_value().integer_value
-
-        self.image_qos_profile = QoSProfile(
-            reliability=self.reliability,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            durability=QoSDurabilityPolicy.VOLATILE,
-            depth=1
-        )
-
-        self._pub = self.create_lifecycle_publisher(
-            DetectionArray, "detections", 10)
-        self._srv = self.create_service(
-            SetBool, "enable", self.enable_cb
-        )
         self.cv_bridge = CvBridge()
 
-        return TransitionCallbackReturn.SUCCESS
-
-    def enable_cb(self, request, response):
-        self.enable = request.data
-        response.success = True
-        return response
-
-    def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
-        self.get_logger().info(f'Activating {self.get_name()}')
-
-        try:
-            self.yolo = YOLO(self.model)  # 모델 로딩
-            self.yolo.fuse()
-        except FileNotFoundError:
-            self.get_logger().error(f"Error: Model file '{self.model}' not found!")
-            return TransitionCallbackReturn.FAILURE
-        except Exception as e:
-            self.get_logger().error(f"Error while loading model '{self.model}': {str(e)}")
-            return TransitionCallbackReturn.FAILURE
-
-        # subs
-        self._sub = self.create_subscription(
+        self.create_subscription(
             Image,
             "image_raw",
             self.image_cb,
-            self.image_qos_profile
+            10
         )
 
-        super().on_activate(state)
+        # --- 변경점 1: 디버깅용 Publisher 추가 ---
+        self._lane_pub = self.create_publisher(Image, "image_lane", 10)
+        self._roi_pub = self.create_publisher(Image, "image_roi", 10)
+        self._canny_pub = self.create_publisher(Image, "image_canny", 10)
+        # -----------------------------------------
 
-        return TransitionCallbackReturn.SUCCESS
-
-
-    def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
-        self.get_logger().info(f'Deactivating {self.get_name()}')
-
-        del self.yolo
-        if 'cuda' in self.device:
-            self.get_logger().info("Clearing CUDA cache")
-            cuda.empty_cache()
-
-        self.destroy_subscription(self._sub)
-        self._sub = None
-
-        super().on_deactivate(state)
-
-        return TransitionCallbackReturn.SUCCESS
-
-    def on_cleanup(self, state: LifecycleState) -> TransitionCallbackReturn:
-        self.get_logger().info(f'Cleaning up {self.get_name()}')
-
-        self.destroy_publisher(self._pub)
-
-        del self.image_qos_profile
-
-        return TransitionCallbackReturn.SUCCESS
-
-    def parse_hypothesis(self, results: Results) -> List[Dict]:
-
-        hypothesis_list = []
-
-        box_data: Boxes
-        for box_data in results.boxes:
-            hypothesis = {
-                "class_id": int(box_data.cls),
-                "class_name": self.yolo.names[int(box_data.cls)],
-                "score": float(box_data.conf)
-            }
-            hypothesis_list.append(hypothesis)
-
-        return hypothesis_list
-
-    def parse_boxes(self, results: Results) -> List[BoundingBox2D]:
-
-        boxes_list = []
-
-        box_data: Boxes
-        for box_data in results.boxes:
-
-            msg = BoundingBox2D()
-
-            # get boxes values
-            box = box_data.xywh[0]
-            msg.center.position.x = float(box[0])
-            msg.center.position.y = float(box[1])
-            msg.size.x = float(box[2])
-            msg.size.y = float(box[3])
-
-            # append msg
-            boxes_list.append(msg)
-
-        return boxes_list
-
-    def parse_masks(self, results: Results) -> List[Mask]:
-
-        masks_list = []
-
-        def create_point2d(x: float, y: float) -> Point2D:
-            p = Point2D()
-            p.x = x
-            p.y = y
-            return p
-
-        mask: Masks
-        for mask in results.masks:
-
-            msg = Mask()
-
-            msg.data = [create_point2d(float(ele[0]), float(ele[1]))
-                        for ele in mask.xy[0].tolist()]
-            msg.height = results.orig_img.shape[0]
-            msg.width = results.orig_img.shape[1]
-
-            masks_list.append(msg)
-
-        return masks_list
-
-    def parse_keypoints(self, results: Results) -> List[KeyPoint2DArray]:
-
-        keypoints_list = []
-
-        points: Keypoints
-        for points in results.keypoints:
-
-            msg_array = KeyPoint2DArray()
-
-            if points.conf is None:
-                continue
-
-            for kp_id, (p, conf) in enumerate(zip(points.xy[0], points.conf[0])):
-
-                if conf >= self.threshold:
-                    msg = KeyPoint2D()
-
-                    msg.id = kp_id + 1
-                    msg.point.x = float(p[0])
-                    msg.point.y = float(p[1])
-                    msg.score = float(conf)
-
-                    msg_array.data.append(msg)
-
-            keypoints_list.append(msg_array)
-
-        return keypoints_list
+        self.get_logger().info('LaneDetectionNode has been started with debugging publishers.')
 
     def image_cb(self, msg: Image) -> None:
-        print(msg.header)
+        try:
+            cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception as e:
+            self.get_logger().error(f"Failed to convert image: {e}")
+            return
+            
+        # --- 변경점 2: 중간 이미지를 함께 반환받음 ---
+        lane_image, roi_image, canny_image = self.process_image_for_lane_detection(cv_image)
+        # ---------------------------------------------
 
-        if self.enable:
+        try:
+            # 최종 차선 인식 이미지 발행
+            lane_msg = self.cv_bridge.cv2_to_imgmsg(lane_image, "bgr8")
+            lane_msg.header = msg.header
+            self._lane_pub.publish(lane_msg)
 
-            # convert image + predict
-            cv_image = self.cv_bridge.imgmsg_to_cv2(msg)
-            results = self.yolo.predict(
-                source=cv_image,
-                verbose=False,
-                stream=False,
-                conf=self.threshold,
-                device=self.device
-            )
-            results: Results = results[0].cpu()
+            # --- 디버깅용 이미지들을 각각 발행 ---
+            # ROI 이미지는 단일 채널이므로 'mono8'로 인코딩하여 발행
+            roi_msg = self.cv_bridge.cv2_to_imgmsg(roi_image, "mono8")
+            roi_msg.header = msg.header
+            self._roi_pub.publish(roi_msg)
 
-            if results.boxes:
-                hypothesis = self.parse_hypothesis(results)
-                boxes = self.parse_boxes(results)
+            # Canny 엣지 이미지도 'mono8'로 인코딩하여 발행
+            canny_msg = self.cv_bridge.cv2_to_imgmsg(canny_image, "mono8")
+            canny_msg.header = msg.header
+            self._canny_pub.publish(canny_msg)
+            # ------------------------------------
 
-            if results.masks:
-                masks = self.parse_masks(results)
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish images: {e}")
 
-            if results.keypoints:
-                keypoints = self.parse_keypoints(results)
+    def process_image_for_lane_detection(self, image):
+            height, width = image.shape[:2]
+            
+            # --- 1. 색상 필터링으로 변경 (기존 그레이스케일 코드 대체) ---
+            # BGR 이미지를 HSV 색상 공간으로 변환
+            hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            
+            # << 중요 >>
+            # 아래 값들은 시작점일 뿐이며, 제공해드린 calibration_tuner.py로
+            # 직접 찾은 최적의 값을 여기에 적용해야 합니다.
+            lower_yellow = np.array([0, 59, 106])
+            upper_yellow = np.array([96, 200, 255])
 
-            # create detection msgs
-            detections_msg = DetectionArray()
+            lower_white = np.array([0, 0, 180])
+            upper_white = np.array([255, 30, 255])
 
-            for i in range(len(results)):
+            # 노란색 마스크와 흰색 마스크를 각각 생성
+            yellow_mask = cv2.inRange(hsv_image, lower_yellow, upper_yellow)
+            white_mask = cv2.inRange(hsv_image, lower_white, upper_white)
+            
+            # 두 마스크를 하나로 합침
+            color_mask = cv2.bitwise_or(yellow_mask, white_mask)
+            # ----------------------------------------------------
 
-                aux_msg = Detection()
+            # 블러 처리는 기존 gray_image 대신 color_mask에 적용
+            blur_image = cv2.GaussianBlur(color_mask, (5, 5), 0)
+            
+            # 캐니 엣지 검출은 블러 처리된 마스크 이미지에 적용
+            canny_image = cv2.Canny(blur_image, 30, 90)
+            
+            # --- 이후 로직은 기존과 동일 ---
+            roi_vertices = np.array([[(0, height), (width / 2, height / 2 + 50), (width, height)]], dtype=np.int32)
+            masked_image = self.region_of_interest(canny_image, roi_vertices)
+            
+            lines = cv2.HoughLinesP(masked_image, 1, np.pi / 180, 50, np.array([]), minLineLength=40, maxLineGap=100)
+            
+            line_image = np.zeros_like(image)
+            if lines is not None:
+                line_image = self.draw_lines_on_image(line_image, lines, image.shape[0])
 
-                if results.boxes:
-                    aux_msg.class_id = hypothesis[i]["class_id"]
-                    aux_msg.class_name = hypothesis[i]["class_name"]
-                    aux_msg.score = hypothesis[i]["score"]
+            combined_image = cv2.addWeighted(image, 0.8, line_image, 1, 1)
 
-                    aux_msg.bbox = boxes[i]
+            # 디버깅을 위해 기존 masked_image 대신 color_mask를 반환하면 더 유용합니다.
+            return combined_image, color_mask, canny_image
+        
+    def region_of_interest(self, image, vertices):
+        mask = np.zeros_like(image)
+        cv2.fillPoly(mask, vertices, 255)
+        masked_image = cv2.bitwise_and(image, mask)
+        return masked_image
 
-                if results.masks:
-                    aux_msg.mask = masks[i]
+    # draw_lines 함수를 2개로 분리하여 재사용성 높임
+    def draw_lines_on_image(self, image, lines, height):
+        left_fit = []
+        right_fit = []
+        
+        for line in lines:
+            x1, y1, x2, y2 = line.reshape(4)
+            parameters = np.polyfit((x1, x2), (y1, y2), 1)
+            slope = parameters[0]
+            intercept = parameters[1]
+            if slope < -0.5:
+                left_fit.append((slope, intercept))
+            elif slope > 0.5:
+                right_fit.append((slope, intercept))
 
-                if results.keypoints:
-                    aux_msg.keypoints = keypoints[i]
+        left_fit_average = np.average(left_fit, axis=0) if left_fit else None
+        right_fit_average = np.average(right_fit, axis=0) if right_fit else None
 
-                detections_msg.detections.append(aux_msg)
-
-            # publish detections
-            detections_msg.header = msg.header
-            self._pub.publish(detections_msg)
-
-            del results
-            del cv_image
+        if left_fit_average is not None:
+            left_line = self.make_coordinates(height, left_fit_average)
+            cv2.line(image, (left_line[0], left_line[1]), (left_line[2], left_line[3]), (0, 0, 255), 10)
+        
+        if right_fit_average is not None:
+            right_line = self.make_coordinates(height, right_fit_average)
+            cv2.line(image, (right_line[0], right_line[1]), (right_line[2], right_line[3]), (0, 0, 255), 10)
+        return image
+        
+    def make_coordinates(self, height, line_parameters):
+        slope, intercept = line_parameters
+        y1 = height
+        y2 = int(y1 * (3/5))
+        x1 = int((y1 - intercept) / slope)
+        x2 = int((y2 - intercept) / slope)
+        return np.array([x1, y1, x2, y2])
 
 
 def main():
     rclpy.init()
-    node = Yolov8Node()
-    node.trigger_configure()
-    node.trigger_activate()
+    node = LaneDetectionNode()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
