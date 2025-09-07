@@ -13,16 +13,15 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='hhk-laptop',
-    maintainer_email='whaihong@g.skku.edu',
+    maintainer='woongje',
+    maintainer_email='jchoiwoong@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'motion_planner_node = decision_making_pkg.motion_planner_node:main',
-            'path_planner_node = decision_making_pkg.path_planner_node:main',
-            'path_visualizer_node = decision_making_pkg.path_visualizer_node:main',  # ← 추가
+            'path_planner = decision_making_pkg.path_planner_node:main',
+            'motion_planner = decision_making_pkg.motion_planner_node:main',
         ],
     },
 )

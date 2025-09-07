@@ -28,7 +28,7 @@ class LidarSensorDataPublisher(Node):
         super().__init__('lidar_publisher_node')
 
         self.qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
             durability=QoSDurabilityPolicy.VOLATILE,
             depth=1
